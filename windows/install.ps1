@@ -20,9 +20,12 @@ $p = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
 New-Item -ItemType Directory -Path $BaseDir -Force | Out-Null
 Copy-Item -Path "$ScriptDir\ut-wifi-login.ps1" -Destination "$BaseDir\ut-wifi-login.ps1" -Force
 
-# Save credentials and restrict permissions to SYSTEM and Administrators only (equivalent to chmod 600 root:wheel)
-Set-Content -Path $CredFile -Value "$u`n$p" -Encoding UTF8 -NoNewline
+# Create the credentials file with restricted permissions BEFORE writing to it
+# (equivalent to chmod 600 root:wheel), so it's never briefly world-readable
+# under ProgramData's default inherited ACL.
+New-Item -ItemType File -Path $CredFile -Force | Out-Null
 & icacls.exe $CredFile /inheritance:r /grant:r "NT AUTHORITY\SYSTEM:(R,W)" "BUILTIN\Administrators:(R,W)" >$null
+Set-Content -Path $CredFile -Value "$u`n$p" -Encoding UTF8 -NoNewline
 
 # Register Event-Driven Scheduled Tasks (Login on Network Connect, Logout on Shutdown/Sleep)
 $loginXml = @"
