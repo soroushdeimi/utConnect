@@ -16,7 +16,7 @@ and auto-logout on shutdown/restart.
 ## Install
 
 ```bash
-git clone https://github.com/<your-username>/utConnect.git
+git clone https://github.com/soroushdeimi/utConnect
 cd utConnect
 sudo ./install.sh
 ```
