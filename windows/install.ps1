@@ -27,6 +27,14 @@ New-Item -ItemType File -Path $CredFile -Force | Out-Null
 & icacls.exe $CredFile /inheritance:r /grant:r "NT AUTHORITY\SYSTEM:(R,W)" "BUILTIN\Administrators:(R,W)" >$null
 Set-Content -Path $CredFile -Value "$u`n$p" -Encoding UTF8 -NoNewline
 
+# The login task's EventTrigger watches these two Operational logs, but they
+# are disabled by default on many stock Windows installs (unlike the System
+# log the logout task uses, which is always on). A disabled log never records
+# the event, so the trigger would silently never fire. Enabling an
+# already-enabled log is a harmless no-op, so this is safe either way.
+wevtutil set-log "Microsoft-Windows-NetworkProfile/Operational" /enabled:true 2>$null
+wevtutil set-log "Microsoft-Windows-WLAN-AutoConfig/Operational" /enabled:true 2>$null
+
 # Register Event-Driven Scheduled Tasks (Login on Network Connect, Logout on Shutdown/Sleep)
 $loginXml = @"
 <?xml version="1.0" encoding="UTF-16"?>

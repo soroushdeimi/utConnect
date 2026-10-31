@@ -83,7 +83,11 @@ committed to this repo or sent anywhere except `internet.ut.ac.ir`.
 
 This also registers two scheduled tasks (Task Scheduler, running as `SYSTEM`):
 one that logs in on network-connect events, and one that logs out on
-shutdown/restart **and sleep**.
+shutdown/restart **and sleep**. It also enables the two Windows event logs
+those triggers depend on (`NetworkProfile` and `WLAN-AutoConfig`
+Operational), which are off by default on some installs — `update.bat` does
+not redo this, so if you installed an earlier version, re-run `install.bat`
+once to pick it up.
 
 To change the saved username/password later, just run `install.bat` again.
 
