@@ -1,0 +1,5 @@
+#!/bin/bash
+# Idle until launchd stops us (shutdown/restart), then log out of the UT portal.
+trap '/usr/local/libexec/ut-wifi-login --logout; exit 0' TERM
+sleep 2147483647 &
+wait $!

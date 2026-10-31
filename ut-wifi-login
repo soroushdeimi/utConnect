@@ -1,0 +1,144 @@
+#!/bin/bash
+# Auto-login to the University of Tehran Wi-Fi captive portal (FortiGate).
+# Runs as root from launchd on network changes. Every run that is not a plain
+# duplicate leaves one line in the log, so a silent exit never needs guessing.
+# Usage: ut-wifi-login [--force | --logout]
+
+IFACE=en0
+PORTAL_HOST=internet.ut.ac.ir
+PORTAL_IP=80.66.179.8
+PROBE=http://captive.apple.com/hotspot-detect.html
+CRED=/usr/local/etc/ut-wifi-login/credentials
+LOG=/var/log/ut-wifi-login.log
+LOCK=/var/run/ut-wifi-login.lock
+STATE=/var/run/ut-wifi-login.state     # "<ip> <gw> <epoch> <ok|fail>"
+mode=$1
+
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+# One run at a time. A burst of notifications just exits here.
+mkdir "$LOCK" 2>/dev/null || exit 0
+trap 'rmdir "$LOCK"; route -n delete -host "$PORTAL_IP" >/dev/null 2>&1' EXIT
+
+# Association fires events before DHCP finishes: wait for an address instead of giving up.
+tries=25; [ "$mode" = "--logout" ] && tries=1
+ip=""
+for _ in $(seq 1 $tries); do
+  ip=$(ipconfig getifaddr "$IFACE" 2>/dev/null)
+  [ -n "$ip" ] && break
+  sleep 1
+done
+[ -n "$ip" ] || exit 0                 # Wi-Fi off / not connected: nothing to do
+gw=$(ipconfig getoption "$IFACE" router 2>/dev/null)
+[ -n "$gw" ] || { log "$ip has no router yet"; exit 0; }
+
+# Debounce only duplicates of an already-settled state (our own route changes
+# fire new notifications): same network, ok within 20s, or failed within 30s.
+if [ -z "$mode" ] && [ -f "$STATE" ]; then
+  read -r s_ip s_gw s_t s_r < "$STATE"
+  age=$(( $(date +%s) - s_t ))
+  if [ "$s_ip $s_gw" = "$ip $gw" ] && { [ "$s_r" = ok ] && [ $age -lt 20 ] || [ "$s_r" = fail ] && [ $age -lt 30 ]; }; then
+    exit 0
+  fi
+fi
+result() { echo "$ip $gw $(date +%s) $1" > "$STATE"; }
+
+portal_route() {                       # keep VPN/TUN routes from swallowing portal traffic
+  route -n delete -host "$PORTAL_IP" >/dev/null 2>&1
+  route -n add -host "$PORTAL_IP" "$gw" >/dev/null 2>&1
+}
+pcurl() { curl -s -m "${T:-8}" --interface "$IFACE" --resolve "$PORTAL_HOST:443:$PORTAL_IP" "$@" 2>/dev/null; }
+probe() { curl -s -m 6 --interface "$IFACE" -w '|CURLOK' "$PROBE" 2>/dev/null; }
+regw() { gw=$(ipconfig getoption "$IFACE" router 2>/dev/null); [ -n "$gw" ]; }
+
+if [ "$mode" = "--logout" ]; then
+  portal_route
+  code=$(T=4 pcurl -o /dev/null -w '%{http_code}' "https://$PORTAL_HOST/logout?")
+  log "logout ($ip): http $code"; rm -f "$STATE"; exit 0
+fi
+
+# Gateway can take a few seconds after (re)association before it redirects,
+# and roaming between campus APs can change subnet/gateway mid-run.
+ok=""
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  cur_ip=$(ipconfig getifaddr "$IFACE" 2>/dev/null)
+  if [ "$cur_ip" != "$ip" ]; then
+    [ -n "$cur_ip" ] || { log "lost $IFACE mid-run (had $ip)"; result fail; exit 0; }
+    log "roamed $ip -> $cur_ip on $IFACE"; ip=$cur_ip; regw || { sleep 1; continue; }
+  fi
+  p=$(probe)
+  case "$p" in
+    *CURLOK) case "$p" in *Success*|*window.location*) ok=1 ;; esac ;;
+    *) p="" ;;  # curl itself failed (timeout/reset): no body to trust
+  esac
+  [ -n "$ok" ] && break
+  sleep 2
+done
+p=${p%|CURLOK}
+if [ "$mode" != "--force" ] && echo "$p" | grep -q Success; then
+  log "online ($ip via $gw): nothing to do"; result ok; exit 0
+fi
+if [ -z "$p" ]; then
+  log "no reply from $ip via $gw after 10 tries (network still settling or down)"; result fail; exit 0
+fi
+
+# Unauthenticated http gets a JS redirect to /fgtauth?<token>.
+url=$(echo "$p" | sed -n "s/.*window\.location=[\"']\([^\"']*\)[\"'].*/\1/p")
+case "$url" in
+  https://$PORTAL_HOST*) ;;
+  *) log "no UT portal on $ip via $gw; raw reply: $(echo "$p" | tr -d '\r\n' | head -c 160)"; result fail; exit 0 ;;
+esac
+
+portal_route
+page=$(pcurl -L "$url")
+for _ in 1 2; do                       # follow up to two more JS redirects
+  echo "$page" | grep -q 'name="magic"' && break
+  next=$(echo "$page" | sed -n "s/.*window\.location=[\"']\([^\"']*\)[\"'].*/\1/p")
+  [ -n "$next" ] || break
+  page=$(pcurl -L "$next")
+done
+if ! echo "$page" | grep -q 'name="magic"'; then
+  log "no login form at $url ($ip via $gw): $(echo "$page" | tr -d '\r\n' | head -c 120)"; result fail; exit 1
+fi
+
+attr() { echo "$page" | tr '\n' ' ' | sed -n "s/.*name=\"$1\" value=\"\([^\"]*\)\".*/\1/p"; }
+user=$(sed -n 1p "$CRED"); pass=$(sed -n 2p "$CRED")
+[ -n "$user" ] && [ -n "$pass" ] || { log "credentials file empty"; result fail; exit 1; }
+esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+do_login() {   # $1 = login page HTML (has magic/4Tredir); submits with our own account
+  local pg="$1" magic redir resp
+  magic=$(echo "$pg" | tr '\n' ' ' | sed -n 's/.*name="magic" value="\([^"]*\)".*/\1/p')
+  redir=$(echo "$pg" | tr '\n' ' ' | sed -n 's/.*name="4Tredir" value="\([^"]*\)".*/\1/p')
+  resp=$(T=10 pcurl -K - "https://$PORTAL_HOST/" <<CFG
+data-urlencode = "4Tredir=$(esc "$redir")"
+data-urlencode = "magic=$(esc "$magic")"
+data-urlencode = "username=$(esc "$user")"
+data-urlencode = "password=$(esc "$pass")"
+CFG
+)
+  printf '%s' "$resp"
+}
+
+resp=$(do_login "$page")
+for _ in 1 2 3 4 5; do probe | grep -q Success && { log "login ok ($ip via $gw)"; result ok; exit 0; }; sleep 1; done
+why=$(echo "$resp" | sed 's/<[^>]*>/ /g' | tr -s ' \n\t' ' ' | head -c 160)
+
+# This account's own session may already be open elsewhere (own laptop+phone,
+# a stale session after a crash, etc.) and the portal caps concurrent logins.
+# Our own account, our own prior sessions: logging them out to log back in is
+# not bypassing anything, so retry once through a logout.
+if echo "$why" | grep -qiE 'device|session|concurrent|limit|دستگاه|نشست|مجاز'; then
+  log "login failed ($ip via $gw), looks like a device/session limit: logging out and retrying once: $why"
+  T=4 pcurl -o /dev/null "https://$PORTAL_HOST/logout?"; sleep 2
+  page2=$(pcurl -L "$url")
+  if echo "$page2" | grep -q 'name="magic"'; then
+    resp=$(do_login "$page2")
+    for _ in 1 2 3 4 5; do probe | grep -q Success && { log "login ok after logout retry ($ip via $gw)"; result ok; exit 0; }; sleep 1; done
+    why=$(echo "$resp" | sed 's/<[^>]*>/ /g' | tr -s ' \n\t' ' ' | head -c 160)
+  fi
+fi
+
+log "login failed ($ip via $gw): $why"; result fail
+launchctl asuser "$(stat -f %u /dev/console)" osascript -e 'display notification "Login failed - too many devices? Check acct.ut.ac.ir" with title "UT Wi-Fi"' >/dev/null 2>&1
+exit 1
