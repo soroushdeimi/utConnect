@@ -92,9 +92,33 @@ function Invoke-PortalCurl {
     }
 }
 
+# Resolve the probe host through the Wi-Fi adapter's own DNS server. A VPN/TUN
+# app's resolver can't answer before the portal login, so the probe used to fail
+# before it was even sent and the network looked dead.
+$ProbeHost = "captive.apple.com"
+$script:ProbeResolve = @()
+function Update-ProbeResolve {
+    param([string]$Gw, [int]$IfIndex)
+    $script:ProbeResolve = @()
+    $dns = (Get-DnsClientServerAddress -InterfaceIndex $IfIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses | Select-Object -First 1
+    if (-not $dns) { return }
+    $added = $false
+    if ($Gw -and $dns -ne $Gw) {
+        & route.exe ADD $dns MASK 255.255.255.255 $Gw METRIC 1 IF $IfIndex >$null 2>&1
+        $added = ($LASTEXITCODE -eq 0)
+    }
+    try {
+        $a = Resolve-DnsName -Name $ProbeHost -Type A -Server $dns -DnsOnly -NoHostsFile -QuickTimeout -ErrorAction Stop |
+            Where-Object { $_.Type -eq 'A' } | Select-Object -First 1 -ExpandProperty IPAddress
+        if ($a) { $script:ProbeResolve = @("--resolve", "${ProbeHost}:80:$a") }
+    } catch {}
+    if ($added) { & route.exe DELETE $dns >$null 2>&1 }
+}
+
 function Invoke-Probe {
     param([string]$LocalIP)
-    return (& $CurlExe -s -m 6 --interface $LocalIP -w "|CURLOK" $ProbeUrl 2>$null) -join "`n"
+    $args2 = @("-s", "-m", "6", "--interface", $LocalIP) + $script:ProbeResolve + @("-w", "|CURLOK", $ProbeUrl)
+    return (& $CurlExe @args2 2>$null) -join "`n"
 }
 
 function Save-State {
@@ -158,6 +182,8 @@ try {
         exit 0
     }
 
+    Update-ProbeResolve -Gw $gw -IfIndex $ifIndex
+
     # Probe captive portal (up to 10 tries, handling roaming mid-run)
     $ok = $false
     $p = ""
@@ -175,6 +201,7 @@ try {
             $gw = $curNet.GW
             $ifIndex = $curNet.IfIndex
             if (-not $gw) { Start-Sleep -Seconds 1; continue }
+            Update-ProbeResolve -Gw $gw -IfIndex $ifIndex
         }
         $p = Invoke-Probe -LocalIP $ip
         if ($p -like "*|CURLOK") {
