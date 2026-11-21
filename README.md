@@ -5,7 +5,7 @@ and auto-logout on shutdown/restart. macOS and Windows.
 
 - Runs from `launchd` when the network changes (or the machine shuts down), plus a
   cheap re-check every 30 s so a missed event (AP roaming, slow DHCP) still logs in.
-- macOS: gateways `172.18.*` / `172.30.*` are treated as UT Wi-Fi. Any other gateway
+- macOS: gateways `172.17.*` (Pardis Olum) / `172.18.*` / `172.30.*` are treated as UT Wi-Fi. Any other gateway
   (e.g. NBIC) gets one quick probe and is used only if the captive-portal redirect
   points at `internet.ut.ac.ir`; otherwise it is skipped (logged once per network).
   Login itself also requires that redirect to point at `internet.ut.ac.ir`.

@@ -18,7 +18,8 @@ log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
 
 # One run at a time. A burst of notifications just exits here.
 mkdir "$LOCK" 2>/dev/null || exit 0
-trap 'rmdir "$LOCK"; route -n delete -host "$PORTAL_IP" >/dev/null 2>&1' EXIT
+dns_route=""
+trap 'rmdir "$LOCK"; route -n delete -host "$PORTAL_IP" >/dev/null 2>&1; [ -n "$dns_route" ] && route -n delete -host "$dns_route" >/dev/null 2>&1' EXIT
 
 # Association fires events before DHCP finishes: wait for an address instead of giving up.
 tries=25; [ "$mode" = "--logout" ] && tries=1
@@ -32,22 +33,43 @@ done
 gw=$(ipconfig getoption "$IFACE" router 2>/dev/null)
 [ -n "$gw" ] || { log "$ip has no router yet"; exit 0; }
 
-# University of Tehran Wi-Fi is recognised by its gateway (172.18.x / 172.30.x).
+# Resolve the probe host through the Wi-Fi's own DNS server. A VPN/TUN app's
+# local resolver (127.0.0.1) can't answer before the portal login, so the probe
+# used to fail before it was even sent and the network looked dead / non-UT.
+PROBE_HOST=captive.apple.com
+probe_res=()
+resolve_probe() {
+  local dns a
+  probe_res=()
+  dns=$(ipconfig getoption "$IFACE" domain_name_server 2>/dev/null)
+  [ -n "$dns" ] || return 0
+  if ! route -n get "$dns" 2>/dev/null | grep -q "interface: $IFACE"; then
+    route -n add -host "$dns" "$gw" >/dev/null 2>&1 && dns_route=$dns
+  fi
+  a=$(dig +short +time=2 +tries=2 @"$dns" "$PROBE_HOST" A 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$' | head -1)
+  [ -n "$dns_route" ] && { route -n delete -host "$dns_route" >/dev/null 2>&1; dns_route=""; }
+  [ -n "$a" ] && probe_res=(--resolve "$PROBE_HOST:80:$a")
+  return 0
+}
+resolve_probe
+
+# University of Tehran Wi-Fi is recognised by its gateway (172.17.x Pardis
+# Olum / 172.18.x / 172.30.x).
 # Any other gateway (e.g. NBIC) gets one cheap probe: we only go on if the
 # captive-portal redirect really points at the UT portal. Otherwise exit, and
 # log the gateway once per network so a missed UT network is easy to spot.
 known=""
-case "$gw" in 172.18.*|172.30.*) known=1 ;; esac
+case "$gw" in 172.17.*|172.18.*|172.30.*) known=1 ;; esac
 if [ -z "$known" ] && [ -z "$mode" ]; then
   s_ip=""; s_gw=""; s_t=0; s_r=""
   [ -f "$STATE" ] && read -r s_ip s_gw s_t s_r < "$STATE"
   same=""; [ "$s_ip $s_gw" = "$ip $gw" ] && [ "$s_r" = skip ] && same=1
   [ -n "$same" ] && [ $(( $(date +%s) - s_t )) -lt 60 ] && exit 0
-  p=$(curl -s -m 5 --interface "$IFACE" "$PROBE" 2>/dev/null)
+  p=$(curl -s -m 5 --interface "$IFACE" "${probe_res[@]}" "$PROBE" 2>/dev/null)
   case "$p" in
     *window.location=*"$PORTAL_HOST"*) log "non-UT gateway $gw ($ip) but redirects to $PORTAL_HOST: treating as UT" ;;
     *)
-      [ -n "$same" ] || log "not UT Wi-Fi: $ip via $gw (no $PORTAL_HOST redirect), skipping"
+      [ -n "$same" ] || log "not UT Wi-Fi: $ip via $gw (no $PORTAL_HOST redirect), skipping; reply: $(echo "${p:-<none>}" | tr -d '\r\n' | head -c 120)"
       echo "$ip $gw $(date +%s) skip" > "$STATE"; exit 0 ;;
   esac
 fi
@@ -68,7 +90,7 @@ portal_route() {                       # keep VPN/TUN routes from swallowing por
   route -n add -host "$PORTAL_IP" "$gw" >/dev/null 2>&1
 }
 pcurl() { curl -s -m "${T:-8}" --interface "$IFACE" --resolve "$PORTAL_HOST:443:$PORTAL_IP" "$@" 2>/dev/null; }
-probe() { curl -s -m 6 --interface "$IFACE" -w '|CURLOK' "$PROBE" 2>/dev/null; }
+probe() { curl -s -m 6 --interface "$IFACE" "${probe_res[@]}" -w '|CURLOK' "$PROBE" 2>/dev/null; }
 regw() { gw=$(ipconfig getoption "$IFACE" router 2>/dev/null); [ -n "$gw" ]; }
 
 if [ "$mode" = "--logout" ]; then
@@ -84,7 +106,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
   cur_ip=$(ipconfig getifaddr "$IFACE" 2>/dev/null)
   if [ "$cur_ip" != "$ip" ]; then
     [ -n "$cur_ip" ] || { log "lost $IFACE mid-run (had $ip)"; result fail; exit 0; }
-    log "roamed $ip -> $cur_ip on $IFACE"; ip=$cur_ip; regw || { sleep 1; continue; }
+    log "roamed $ip -> $cur_ip on $IFACE"; ip=$cur_ip; regw || { sleep 1; continue; }; resolve_probe
   fi
   p=$(probe)
   case "$p" in
