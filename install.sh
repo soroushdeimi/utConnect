@@ -1,11 +1,16 @@
 #!/bin/bash
 # Run:  sudo ./install.sh      (asks for your UT username/password; nothing is echoed or logged)
 set -e
-load() {  # bootout is async; wait for it, then retry bootstrap
+load() {  # bootout is async (the logout daemon sends a logout on SIGTERM first):
+  # wait until the old job is really gone, then retry bootstrap
   launchctl bootout system/com.utconnect.$1 2>/dev/null || true
-  for _ in 1 2 3 4 5; do
+  for _ in $(seq 1 20); do
+    launchctl print system/com.utconnect.$1 >/dev/null 2>&1 || break
     sleep 1
+  done
+  for _ in 1 2 3 4 5; do
     launchctl bootstrap system /Library/LaunchDaemons/com.utconnect.$1.plist 2>/dev/null && return 0
+    sleep 1
   done
   launchctl bootstrap system /Library/LaunchDaemons/com.utconnect.$1.plist
 }
