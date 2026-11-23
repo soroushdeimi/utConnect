@@ -1,0 +1,5 @@
+﻿start 11:18:23
+after logout: <HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>
+--- log since start
+2026-11-10 11:18:26 online (172.17.86.201 via 172.17.84.1): nothing to do
+RESULT: online
